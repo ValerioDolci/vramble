@@ -1,0 +1,33 @@
+# What can be asked for. Copy to services.yaml and adapt.
+# Service and parameter names are data, not code: yours can be in any language, and callers use
+# exactly the names you write here.
+# `set` maps a parameter onto a ComfyUI node input, `flags` onto a script option.
+
+macros:
+  PY: /usr/bin/python3
+  PY_COMFY: /home/you/venv-comfy/bin/python
+  T: /home/you/comfy-tools
+
+services:
+  image:
+    description: 'Z-Image Turbo: photoreal and faces, the fastest one'
+    time_hint: 2.5 s (6 s the first time)
+    activity: comfy
+    command: ['{PY_COMFY}', '{T}/run_prompt.py', '{T}/wf/zimage.json']
+    required: [prompt]
+    set:                        # parameter -> node.input of the workflow
+      prompt: 27.text
+      seed: 3.seed
+      width: 13.width
+      height: 13.height
+    limits: {width: [256, 2048], height: [256, 2048]}
+
+  voice:
+    description: Text to speech, kokoro on CPU or a GPU model for quality
+    time_hint: a few seconds
+    activity: tts
+    activity_if:                # kokoro runs on CPU: it takes nobody's GPU turn
+      engine: {kokoro: cpu}
+    command: ['{PY}', '{T}/tts_say.py']
+    required: [text]
+    flags: {text: --text, engine: --engine}   # parameter -> option of the script

@@ -1,0 +1,15 @@
+[Unit]
+Description=vramble - GPU arbiter: one lease, a queue with ids, environments started on demand
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__BASE__
+ExecStart=__PYTHON__ __BASE__/vramble.py
+StandardOutput=append:__BASE__/vramble.log
+StandardError=append:__BASE__/vramble.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""gpu-lease — vramble client: take the machine, keep the lease alive, give it back.
+
+  gpu-lease run <activity> [--note T] [--ttl S] [--wait S] [--preempt] [--require-lease] -- <command…>
+      --require-lease: for services (llama-swap & co.) — if vramble does not answer, wait for it and
+      then refuse to start (exit 76) instead of running unarbitrated on a card somebody else holds.
+      without --wait the registry's default_wait applies (llm 90 s, comfy 180 s, music 300 s…);
+      --wait 0 = no queueing, fail immediately with the reason.
+  gpu-lease acquire <activity> [...]   → prints the token
+  gpu-lease release <token> [--drain]
+  gpu-lease status [--json] · gpu-lease preempt [reason] · gpu-lease free [--soft]
+
+If vramble does not answer the command runs anyway (fail-open): the arbiter must never be able to block
+production. A service that would fight over VRAM should pass --require-lease and get the opposite.
+Exit codes: 75 = machine busy · 76 = no lease and --require-lease.
+"""
+import http.client, json, os, socket, signal, subprocess, sys, threading, time, urllib.error, urllib.request
+
+# The CLIs are installed in ~/.local/bin while config.py lives in the base dir: look there too,
+# otherwise they silently fall back to the built-in defaults and ignore config.yaml.
+for _d in (os.path.dirname(os.path.realpath(__file__)),
+           os.environ.get("VRAMBLE_BASE") or "", os.path.expanduser("~/vramble")):
+    if _d and os.path.exists(os.path.join(_d, "config.py")):
+        sys.path.insert(0, _d)
+        break
+try:
+    import config
+    BASE = config.url()
+    SOCKET = config.C.get("socket") or ""
+    TOKEN = config.C.get("token") or ""
+except Exception:                                   # CLI copied elsewhere: keep the default
+    BASE = os.environ.get("VRAMBLE_URL", "http://127.0.0.1:8099")
+    SOCKET = os.environ.get("VRAMBLE_SOCKET", "")
+    TOKEN = os.environ.get("VRAMBLE_TOKEN", "")
+BUSY = 75
+NO_LEASE = 76          # --require-lease and vramble never answered: better not to start at all
+REQUIRE_WAIT = float(os.environ.get("GPU_LEASE_REQUIRE_WAIT", 30))   # vramble restarts in ~3 s
+
+
+def _headers():
+    """The token is a documented way to lock the daemon down: a client that cannot send it makes
+    that knob unusable."""
+    h = {"Content-Type": "application/json"}
+    if TOKEN:
+        h["X-Vramble"] = TOKEN
+    return h
+
+
+def call(path, data=None, method="POST", timeout=180):
+    verb = "GET" if data is None and method == "GET" else method
+    if SOCKET and os.path.exists(SOCKET):
+        try:
+            return _over_socket(SOCKET, verb, path,
+                                None if data is None else json.dumps(data).encode(),
+                                _headers(), timeout)
+        except Exception:
+            pass                      # socket there but not answering: fall back to the port
+    url = BASE + path
+    req = urllib.request.Request(url, method="GET" if data is None and method == "GET" else method,
+                                 data=None if data is None else json.dumps(data).encode(),
+                                 headers=_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        return 0, {"error": f"vramble unreachable: {e}"}
+
+
+class _UnixConnection(http.client.HTTPConnection):
+    """urllib speaks TCP only. Same HTTP, different transport: when vramble offers a unix socket we
+    use it, because there our identity is whatever the kernel says, not what we claim to be."""
+
+    def __init__(self, path, timeout=30):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+def _over_socket(path, method, url_path, data, headers, timeout):
+    c = _UnixConnection(path, timeout)
+    try:
+        c.request(method, url_path, body=data, headers=headers)
+        r = c.getresponse()
+        body = r.read()
+        try:
+            return r.status, json.loads(body or b"{}")
+        except Exception:
+            return r.status, {"text": body.decode("utf-8", "replace")}
+    finally:
+        c.close()
+
+
+def busy_line(r):
+    o = (r or {}).get("holder") or {}
+    if not o:
+        return "machine busy"
+    t = f"{o.get('held_s', 0)}s"
+    if o.get("held_s", 0) > 90:
+        t = f"{o['held_s'] // 60} min"
+    return (f"machine busy: {o.get('activity')} ({o.get('note') or 'no note'}) for {t}"
+            f", lease valid {o.get('expires_in_s', 0)}s more"
+            + ("" if o.get("preemptible") else " · not preemptible: `gpu-lease preempt <activity>`"))
+
+
+def acquire(a, args):
+    """Take the lease. How long to wait for your turn comes from the registry (default_wait
+    of the activity), unless --wait overrides it: a batch job waits, an interactive one does not."""
+    body = {"activity": a, "note": args.get("note", ""), "preempt": args.get("preempt", False)}
+    if args.get("ttl"):
+        body["ttl"] = float(args["ttl"])
+    explicit = args.get("wait") is not None
+    wait = float(args.get("wait") or 0)
+    unreachable_since = None
+    wait_id = f"{os.getpid()}@{os.uname().nodename}"
+    cutoff = None
+    first = True
+    while True:
+        if wait:
+            body["wait"] = wait
+            body["wait_id"] = wait_id
+        code, r = call("/lease", body)
+        if code == 200:
+            return r
+        if code == 0:
+            # vramble is not answering. For a human this is fail-open: the arbiter must never be able to
+            # block the machine. For a service (--require-lease) it is the opposite: starting without
+            # a lease is how two models end up on the same card, which is the failure vramble exists to
+            # prevent. vramble restarts in ~3 s, so we retry for a while before giving up.
+            if args.get("require_lease"):
+                if unreachable_since is None:
+                    unreachable_since = time.time()
+                    print(f"[gpu-lease] {r['error']} → waiting for vramble (up to {REQUIRE_WAIT}s)",
+                          file=sys.stderr)
+                if time.time() - unreachable_since < REQUIRE_WAIT:
+                    time.sleep(2)
+                    continue
+                print(f"[gpu-lease] {r['error']} → giving up: --require-lease, I do not start "
+                      f"without a lease", file=sys.stderr)
+                sys.exit(NO_LEASE)
+            print(f"[gpu-lease] {r['error']} → running without a lease", file=sys.stderr)
+            return None
+        unreachable_since = None
+        if code == 409 and not explicit and not wait:
+            # first answer: read from the registry how long this activity is willing to wait
+            wait = float(r.get("default_wait") or 0)
+            if wait:
+                cutoff = time.time() + wait
+                print(f"[gpu-lease] {busy_line(r)} → waiting up to {int(wait)}s", file=sys.stderr)
+                first = False
+                time.sleep(3)
+                continue
+        if code == 409 and wait:
+            if cutoff is None:
+                cutoff = time.time() + wait
+            if time.time() < cutoff:
+                if first:
+                    print(f"[gpu-lease] {busy_line(r)} → waiting up to {int(wait)}s", file=sys.stderr)
+                    first = False
+                time.sleep(3)
+                continue
+            print(f"[gpu-lease] {busy_line(r)} · wait of {int(wait)}s expired", file=sys.stderr)
+            sys.exit(BUSY)
+        if code == 409:
+            print(f"[gpu-lease] {busy_line(r)}", file=sys.stderr)
+            sys.exit(BUSY)
+        print(f"[gpu-lease] error {code}: {r}", file=sys.stderr)
+        sys.exit(1)
+
+
+def beat(state, stop, every, activity, note):
+    """Keep the lease alive. A 410 means the lease is gone — revoked or preempted — and we still
+    hold the VRAM, so we ask for it back. Politely: re-asking with preempt would let whoever was
+    just evicted throw out the person who evicted them, and `preempt` ignores preemptibility."""
+    while not stop.wait(every):
+        code, r = call("/heartbeat", {"token": state["token"]}, timeout=30)
+        if code != 410:
+            continue
+        code, r = call("/lease", {"activity": activity, "note": note}, timeout=120)
+        if code == 200 and r.get("token"):
+            state["token"] = r["token"]
+            print("[gpu-lease] lease taken again after it was revoked", file=sys.stderr)
+        else:
+            print("[gpu-lease] lease revoked by vramble", file=sys.stderr)
+            return
+
+
+def main():
+    av = sys.argv[1:]
+    if not av:
+        print(__doc__)
+        return 2
+    cmd = av[0]
+
+    if cmd == "status":
+        if "--json" in av:
+            print(json.dumps(call("/status", None, "GET", 20)[1], ensure_ascii=False, indent=2))
+        else:
+            url = BASE + "/status?text=1"
+            try:
+                with urllib.request.urlopen(url, timeout=20) as r:
+                    sys.stdout.write(r.read().decode())
+            except Exception as e:
+                print(f"vramble unreachable: {e}")
+                return 1
+        return 0
+
+    if cmd == "preempt":
+        reason = " ".join(av[1:]) or "explicit request"
+        code, r = call("/preempt", {"reason": reason})
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if code == 200 else 1
+
+    if cmd == "free":
+        code, r = call("/drain", {"hard": "--soft" not in av})
+        if code == 409:
+            print(f"[gpu-lease] {busy_line(r)}", file=sys.stderr)
+            return BUSY
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if code == 200 else 1
+
+    if cmd == "release":
+        code, r = call("/release", {"token": av[1], "drain": "--drain" in av})
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if code == 200 else 1
+
+    if cmd in ("run", "acquire"):
+        rest = av[1:]
+        activity = rest.pop(0) if rest else ""
+        args, cmdline = {}, []
+        while rest:
+            t = rest.pop(0)
+            if t == "--":
+                cmdline = rest
+                break
+            if t == "--preempt":
+                args["preempt"] = True
+            elif t == "--require-lease":
+                args["require_lease"] = True
+            elif t.startswith("--") and rest:
+                args[t[2:]] = rest.pop(0)
+            else:
+                cmdline = [t] + rest
+                break
+        if not activity:
+            print("usage: gpu-lease run <activity> -- <command>", file=sys.stderr)
+            return 2
+        lease = acquire(activity, args)
+        if cmd == "acquire":
+            print(json.dumps(lease or {"note": "no lease (vramble is down)"}, ensure_ascii=False))
+            return 0
+        if not cmdline:
+            print("usage: gpu-lease run <activity> -- <command>", file=sys.stderr)
+            return 2
+        stop = threading.Event()
+        state = {"token": lease["token"]} if lease else None
+        if lease:
+            # The beat must fit inside the lease, not the other way round: with a short --ttl a
+            # fixed 30 s interval let the lease expire under a perfectly healthy process.
+            ttl_lease = float(lease.get("expires_in_s") or args.get("ttl") or 0)
+            every = max(2, int(lease.get("heartbeat_s", 30)))
+            if ttl_lease:
+                every = max(2, int(min(every, ttl_lease / 3)))
+            threading.Thread(target=beat,
+                             args=(state, stop, every, activity, args.get("note", "")), daemon=True).start()
+        # the wrapper must not swallow signals: llama-swap & co. terminate the child, not us
+        proc = subprocess.Popen(cmdline)
+
+        def forward(sig, _frame):
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+        for s_ in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(s_, forward)
+        try:
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            proc.terminate()
+            rc = proc.wait()
+        finally:
+            stop.set()
+            if lease:
+                call("/release", {"token": state["token"]}, timeout=30)
+        return rc
+
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

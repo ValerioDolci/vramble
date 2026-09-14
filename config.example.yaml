@@ -1,0 +1,25 @@
+# vramble configuration. Copy to config.yaml and adapt it to your machine.
+# Every entry can be overridden by an environment variable (in brackets).
+
+#base: ~/vramble                   # where activities.yaml, services.yaml and jobs.db live (VRAMBLE_BASE)
+#                               commented out on purpose: the default is ~/vramble, and a made-up
+#                               path here would be copied into your real config by install.sh
+port: 8099                      # vramble HTTP                                          (VRAMBLE_PORT)
+listen: 127.0.0.1               # never 0.0.0.0: vramble runs commands                  (VRAMBLE_LISTEN)
+socket: ~/vramble/vramble.sock        # unix socket: the caller is identified by the kernel   (VRAMBLE_SOCKET)
+#                                 empty disables it; the CLIs use it when it exists
+token: ""                        # when set, POSTs must carry X-Vramble                  (VRAMBLE_TOKEN)
+submit_token: ""                 # POST /api/jobs runs an arbitrary argv: empty = closed (VRAMBLE_SUBMIT_TOKEN)
+state_file: ""                   # file to dump the state into, empty = do not        (VRAMBLE_STATE_FILE)
+
+# The services it talks to. Change these to point at Ollama, vLLM, another ComfyUI…
+swap_url: http://127.0.0.1:8081     # OpenAI-compatible endpoint of the models        (VRAMBLE_SWAP_URL)
+comfy_url: http://127.0.0.1:8188                                                    # (VRAMBLE_COMFY_URL)
+acestep_url: http://127.0.0.1:8001                                                  # (VRAMBLE_ACESTEP_URL)
+
+# Limits
+timeout_llm: 1800                # cap on an answer forwarded by the proxy            (VRAMBLE_TIMEOUT_LLM)
+timeout_drain: 120               # cap on a drain command from the registry           (VRAMBLE_TIMEOUT_DRAIN)
+body_max: 4000000               # bytes accepted in a POST                           (VRAMBLE_BODY_MAX)
+history_days: 30               # automatic pruning of finished jobs                 (VRAMBLE_HISTORY_DAYS)
+jobs_kept: 2000                                                                    # (VRAMBLE_JOBS_KEPT)

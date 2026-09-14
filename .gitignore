@@ -1,0 +1,10 @@
+# Your machine's configuration: copy the .example files and adapt them. They stay out of git on
+# purpose — paths, endpoints and tokens are yours, not part of the package.
+config.yaml
+activities.yaml
+services.yaml
+jobs.db
+jobs.db-*
+vramble.log
+__pycache__/
+*.pyc

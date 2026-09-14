@@ -1,0 +1,60 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pyyaml
+      - name: Test suite
+        run: python3 tests/all.py
+
+  install-from-scratch:
+    # The package claims it runs anywhere: prove it on a machine nobody configured.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pyyaml
+      - name: First pass stops for review
+        run: |
+          VRAMBLE_NO_SERVICE=1 bash install.sh
+          test -f "$HOME/vramble/config.yaml"
+      - name: Second pass installs
+        run: |
+          sed -i 's|^#*port:.*|port: 8097|' "$HOME/vramble/config.yaml"
+          VRAMBLE_NO_SERVICE=1 bash install.sh
+          test -x "$HOME/.local/bin/gpu-lease"
+      - name: It starts, answers and grants a lease
+        run: |
+          python3 "$HOME/vramble/vramble.py" &
+          for i in $(seq 1 20); do
+            curl -sf -m 2 "127.0.0.1:8097/status?text=1" && break || sleep 1
+          done
+          curl -sf -m 5 "127.0.0.1:8097/status?text=1"
+          # `cpu` on purpose: it declares no start/healthcheck, so the lease is immediate. Asking
+          # for `llm` here would wait 60 s for a llama-swap that does not exist on a CI runner.
+          curl -sf -m 5 -X POST 127.0.0.1:8097/lease \
+               -H 'Content-Type: application/json' \
+               -d '{"activity":"cpu","note":"ci"}' | grep -q token
+      - name: The free-argv submit is closed by default
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST 127.0.0.1:8097/api/jobs \
+                 -H 'Content-Type: application/json' -d '{"kind":"cpu","argv":["/bin/true"]}')
+          test "$code" = "403"
+      - name: A nonsense Content-Length is a 400, not a traceback
+        run: |
+          python3 -c "import socket; s=socket.create_connection(('127.0.0.1',8097),5); s.sendall(b'POST /api/requests HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n'); r=s.recv(200).decode('utf-8','replace'); print(r.splitlines()[0]); assert ' 400 ' in r, r"

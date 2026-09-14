@@ -1,0 +1,69 @@
+# Who can hold the machine. Copy to activities.yaml and adapt.
+# priority: higher wins · preemptible: can yield without losing work
+# vram_gb: what it really needs per GPU · >= whole_card_threshold_gb means it wants the whole card
+# drain_soft/drain_hard: how to make it give the VRAM back · start/healthcheck: how to bring it up
+# In commands you can use {swap_url} {comfy_url} {acestep_url} {base}
+
+global:
+  whole_card_threshold_gb: 15.0
+  heartbeat_s: 30
+activities:
+  research:
+    description: a long run you do not want killed — it never yields the machine
+    priority: 90
+    preemptible: false
+    vram_gb: 16
+    default_wait: 0
+    default_ttl: 43200
+    idle_ttl: 0
+  llm:
+    match: llama-server|vllm      # regex on the process command line: who holds the VRAM
+    description: LLM models behind llama-swap (:8081) — the lease lasts as long as the
+      llama-server process
+    priority: 50
+    preemptible: true
+    vram_gb: 15.7
+    vram_gb_by_note:
+      qwen27b: 14.5
+      qwen27b-vis: 14.5
+      gemma31b: 15.7
+      gemma26b: 15.7
+    default_wait: 90
+    default_ttl: 3600
+    idle_ttl: 1800
+    drain_soft: curl -s -m 60 -X POST {swap_url}/api/models/unload
+    drain_hard: curl -s -m 60 -X POST {swap_url}/api/models/unload
+    healthcheck: curl -sf -m 3 {swap_url}/v1/models
+  comfy:
+    match: ComfyUI|comfy
+    description: 'ComfyUI (:8188): images, video, 3D'
+    priority: 50
+    preemptible: true
+    vram_gb: 15.5
+    default_wait: 180
+    default_ttl: 1800
+    idle_ttl: 900
+    start: systemctl --user reset-failed comfy; systemctl --user start comfy
+    healthcheck: curl -sf -m 3 {comfy_url}/system_stats
+    healthcheck_s: 90
+    interrupt: 'curl -s -m 10 -X POST {comfy_url}/interrupt; curl -s -m 10 -X POST
+      {comfy_url}/queue -H ''Content-Type: application/json'' -d ''{"clear": true}'''
+    drain_soft: 'curl -s -m 30 -X POST {comfy_url}/free -H ''Content-Type: application/json''
+      -d ''{"unload_models":true,"free_memory":true}'''
+    drain_hard: systemctl --user stop comfy
+  tts:
+    description: text to speech on the GPU
+    priority: 40
+    preemptible: true
+    vram_gb: 6
+    default_wait: 60
+    default_ttl: 600
+    idle_ttl: 600
+  cpu:
+    description: work that needs no GPU — it runs beside whoever holds the card
+    priority: 0
+    preemptible: true
+    vram_gb: 0
+    default_wait: 0
+    default_ttl: 600
+    idle_ttl: 0

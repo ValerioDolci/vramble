@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""gpu-job - send a request to the machine queue and follow it.
+
+  gpu-job ask <service> --<param> <value>       ask for a service by name
+  gpu-job services                              list services and their parameters
+  gpu-job img "<prompt>"                        shortcut for an image
+  gpu-job submit <kind> [--note T] -- <command>
+  gpu-job list [--how_many N] [--state queued|running|done|error]
+  gpu-job status <id> [--json] - gpu-job follow <id> - gpu-job cancel <id>
+"""
+import http.client, json, os, socket, sys, time, urllib.error, urllib.request
+
+# The CLIs are installed in ~/.local/bin while config.py lives in the base dir: look there too,
+# otherwise they silently fall back to the built-in defaults and ignore config.yaml.
+for _d in (os.path.dirname(os.path.realpath(__file__)),
+           os.environ.get("VRAMBLE_BASE") or "", os.path.expanduser("~/vramble")):
+    if _d and os.path.exists(os.path.join(_d, "config.py")):
+        sys.path.insert(0, _d)
+        break
+try:
+    import config
+    BASE = config.url()
+    SOCKET = config.C.get("socket") or ""
+    TOKEN = config.C.get("token") or ""
+except Exception:                                   # CLI copied elsewhere: keep the default
+    BASE = os.environ.get("VRAMBLE_URL", "http://127.0.0.1:8099")
+    SOCKET = os.environ.get("VRAMBLE_SOCKET", "")
+    TOKEN = os.environ.get("VRAMBLE_TOKEN", "")
+
+
+
+class _UnixConnection(http.client.HTTPConnection):
+    """urllib speaks TCP only. Same HTTP, different transport: when vramble offers a unix socket we
+    use it, because there our identity is whatever the kernel says, not what we claim to be."""
+
+    def __init__(self, path, timeout=30):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._path)
+
+
+def _over_socket(path, method, url_path, data, headers, timeout):
+    c = _UnixConnection(path, timeout)
+    try:
+        c.request(method, url_path, body=data, headers=headers)
+        r = c.getresponse()
+        body = r.read()
+        try:
+            return r.status, json.loads(body or b"{}")
+        except Exception:
+            return r.status, {"text": body.decode("utf-8", "replace")}
+    finally:
+        c.close()
+
+
+def call(path, data=None, method="GET", timeout=30, headers=None):
+    h = {"Content-Type": "application/json", **(headers or {})}
+    if TOKEN:
+        h.setdefault("X-Vramble", TOKEN)
+    if SOCKET and os.path.exists(SOCKET):
+        try:
+            return _over_socket(SOCKET, method, path,
+                                None if data is None else json.dumps(data).encode(), h, timeout)
+        except Exception:
+            pass                      # socket there but not answering: fall back to the port
+    req = urllib.request.Request(BASE + path, method=method,
+                                 data=None if data is None else json.dumps(data).encode(),
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def line(j):
+    t = ""
+    if j.get("started") and j.get("finished"):
+        t = f" {j['finished'] - j['started']:.0f}s"
+    elif j.get("started"):
+        t = f" for {time.time() - j['started']:.0f}s"
+    pos = f" #{j['position']}" if j.get("state") == "queued" and j.get("position") else ""
+    return (f"{j['id']} {j['state']}{pos}{t} · {j['kind']} · {(j.get('note') or '')[:40]}"
+            + (f" · {j['who']}" if j.get("who") else "")
+            + (f" · rc={j['rc']}" if j.get("rc") not in (None, 0) else ""))
+
+
+def describe_wait(j):
+    ahead = j.get("ahead") or []
+    if not ahead:
+        return ""
+    d = ahead[0]
+    q = f"{d['kind']} ({d.get('note') or '—'})"
+    if d.get("held_s") is not None:
+        q += f", for {d['held_s']}s"
+    rest = f" + {len(ahead) - 1} more queued" if len(ahead) > 1 else ""
+    return f"ahead of you: {q}{rest}"
+
+
+def main():
+    av = sys.argv[1:]
+    if not av:
+        print(__doc__)
+        return 2
+    cmd = av.pop(0)
+
+    if cmd == "list":
+        q = {"how_many": "30"}
+        while av:
+            t = av.pop(0)
+            if t.startswith("--") and av:
+                q[t[2:]] = av.pop(0)
+        code, r = call("/api/jobs?" + "&".join(f"{k}={v}" for k, v in q.items()))
+        if code != 200:
+            print(r)
+            return 1
+        if r.get("current"):
+            print(f"running: {r['current']}")
+        for j in r["job"]:
+            print(" ", line(j))
+        return 0
+
+    if cmd in ("status", "follow", "cancel"):
+        if not av:
+            print("an id is required")
+            return 2
+        jid = av.pop(0)
+        if cmd == "cancel":
+            code, r = call(f"/api/jobs/{jid}/cancel", {}, "POST")
+            print(json.dumps(r, ensure_ascii=False))
+            return 0 if code == 200 else 1
+        code, j = call(f"/api/jobs/{jid}")
+        if code != 200:
+            print(j)
+            return 1
+        if cmd == "status":
+            if "--json" in av:
+                print(json.dumps(j, ensure_ascii=False, indent=2))
+            else:
+                print(line(j))
+                if j.get("state") == "queued":
+                    print(" ", describe_wait(j))
+            return 0
+        last = ""
+        while True:
+            code, j = call(f"/api/jobs/{jid}")
+            if code != 200:
+                print(j)
+                return 1
+            r = line(j) + ("  " + describe_wait(j) if j.get("state") == "queued" else "")
+            if r != last:
+                print(r, flush=True)
+                last = r
+            if j["state"] in ("done", "error", "cancelled", "abandoned", "interrupted", "expired"):
+                if j.get("output"):
+                    print(j["output"].strip()[-1500:])
+                return 0 if j["state"] == "done" else 1
+            time.sleep(2)
+
+    if cmd == "services":
+        code, r = call("/api/services")
+        if code != 200:
+            print(r)
+            return 1
+        for name, s in r.items():
+            needed = ", ".join(s["required"])
+            others = [p for p in s["params"] if p not in s["required"]]
+            print(f"{name:18} {s['time_hint']:22} {s['description']}")
+            print(f"{'':18} needs: {needed or '—'}" + (f" · optional: {', '.join(others)}" if others else ""))
+            if s.get("note"):
+                print(f"{'':18} note: {s['note']}")
+        return 0
+
+    if cmd == "ask":
+        if not av:
+            print("usage: gpu-job ask <service> --<param> <value> …  ·  gpu-job services for the list")
+            return 2
+        body = {"service": av.pop(0), "who": os.environ.get("USER", "cli")}
+        while av:
+            t = av.pop(0)
+            if t.startswith("--") and av:
+                v = av.pop(0)
+                body[t[2:]] = int(v) if v.lstrip("-").isdigit() else v
+            else:
+                print(f"I do not understand: {t}")
+                return 2
+        code, j = call("/api/requests", body, "POST")
+        if code != 200:
+            print(j.get("error") or j)
+            return 1
+        print(line(j))
+        if j.get("state") == "queued" and j.get("ahead"):
+            print(" ", describe_wait(j))
+        return 0
+
+    if cmd == "img":
+        # shortcut: `ask <image service>` with the prompt as a positional argument
+        if not av:
+            print('usage: gpu-job img "<prompt>"')
+            return 2
+        # The image service is whatever your catalog calls it: VRAMBLE_IMG_SERVICE, else a service
+        # named image/immagine, else the first one that takes a `prompt`.
+        code, cat = call("/api/services")
+        names = list(cat) if code == 200 else []
+        service = (os.environ.get("VRAMBLE_IMG_SERVICE")
+                   or next((n for n in ("image", "immagine") if n in names), None)
+                   or next((n for n in names if "prompt" in (cat[n].get("required") or [])), None))
+        if not service:
+            print("no image service in the catalog: use `gpu-job ask <service> --prompt …`")
+            return 2
+        body = {"service": service, "prompt": av.pop(0), "who": os.environ.get("USER", "cli")}
+        while av:
+            t = av.pop(0)
+            if t.startswith("--") and av:
+                v = av.pop(0)
+                body[t[2:]] = int(v) if v.lstrip("-").isdigit() else v
+        code, j = call("/api/requests", body, "POST")
+        if code != 200:
+            print(j.get("error") or j)
+            return 1
+        print(line(j))
+        if j.get("state") == "queued" and j.get("ahead"):
+            print(" ", describe_wait(j))
+        return 0
+
+    if cmd == "submit":
+        if not av:
+            print("usage: gpu-job submit <kind> [--note T] -- <command>")
+            return 2
+        kind = av.pop(0)
+        o, argv = {}, []
+        while av:
+            t = av.pop(0)
+            if t == "--":
+                argv = av
+                break
+            if t.startswith("--") and av:
+                o[t[2:]] = av.pop(0)
+        if not argv:
+            print("a command after -- is required")
+            return 2
+        body = {"kind": kind, "note": o.get("note", ""), "who": o.get("who", os.environ.get("USER", "cli")),
+                 "argv": argv}
+        if o.get("ttl"):
+            body["ttl"] = float(o["ttl"])
+        # the free-argv submit is closed unless vramble has a submit_token: whoever can read the
+        # config can use it, a client that cannot (the bot, an agent) is left out.
+        try:
+            import config as _c
+            tok = _c.C.get("submit_token", "")
+        except Exception:
+            tok = os.environ.get("VRAMBLE_SUBMIT_TOKEN", "")
+        code, j = call("/api/jobs", body, "POST", headers={"X-Vramble-Submit": tok} if tok else None)
+        if code != 200:
+            print(j)
+            return 1
+        print(line(j))
+        if j.get("state") == "queued" and j.get("ahead"):
+            print(" ", describe_wait(j))
+        return 0
+
+    print(f"unknown command: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
