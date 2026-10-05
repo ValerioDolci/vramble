@@ -35,6 +35,26 @@ class Queue(VrambleTest):
         self.add("comfy", note="second")
         self.assertEqual(self.waiting._next(), first["id"])
 
+    def test_a_request_with_somebody_waiting_goes_ahead_of_batch_work(self):
+        """The registry gives `llm` attended_priority 60: a chat gives up after `default_wait`,
+        a batch job loses nothing by letting it pass."""
+        batch = self.add("llm", note="nightly")
+        time.sleep(0.01)
+        chat = self.add("llm", note="gemma", attended=True)
+        self.assertEqual(chat["prio"], 60)
+        self.assertEqual(self.waiting._next(), chat["id"],
+                         "the request with a human behind it must be served first")
+        self.assertIn(chat["id"], [d["id"] for d in self.waiting.job_state(batch["id"])["ahead"]])
+
+    def test_being_attended_does_not_let_the_caller_declare_its_own_rank(self):
+        j = self.add("llm", note="gemma", attended=True, prio=999)
+        self.assertEqual(j["prio"], 60, "attended moves the ceiling, it does not remove it")
+        self.assertEqual(self.add("llm", note="gemma", attended=True, prio=5)["prio"], 5,
+                         "lowering your own priority stays allowed")
+
+    def test_an_activity_without_attended_priority_is_unchanged(self):
+        self.assertEqual(self.add("comfy", attended=True)["prio"], 50)
+
     def test_aging_prevents_starvation(self):
         older = self.add("maintenance")        # prio 10, but waiting for 2 hours
         self.waiting.db.execute("UPDATE job SET created=? WHERE id=?",

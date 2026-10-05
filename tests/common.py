@@ -23,6 +23,7 @@ activities:
     description: "a long run, never yields"
     priority: 90
     preemptible: false
+    reentrant: false
     vram_gb: 16
     default_wait: 0
     default_ttl: 600
@@ -39,6 +40,7 @@ activities:
   llm:
     description: "models"
     priority: 50
+    attended_priority: 60
     preemptible: true
     vram_gb: 15.7
     vram_gb_by_note:

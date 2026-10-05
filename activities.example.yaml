@@ -1,7 +1,13 @@
 # Who can hold the machine. Copy to activities.yaml and adapt.
 # priority: higher wins · preemptible: can yield without losing work
+# attended_priority: rank for requests with somebody waiting on the other end (chat, a bot);
+#   optional, defaults to `priority`. It only changes the order of the queue, never who yields
 # vram_gb: what it really needs per GPU · >= whole_card_threshold_gb means it wants the whole card
 # drain_soft/drain_hard: how to make it give the VRAM back · start/healthcheck: how to bring it up
+# reentrant: default true — a second lease of the same activity joins the first (right for one shared
+#   server: llama-swap, ComfyUI). false — every lease is its own workload wanting the card, so a
+#   second session waits like any other contender; only what runs inside the lease (it inherits
+#   VRAMBLE_LEASE from gpu-lease run) re-enters
 # In commands you can use {swap_url} {comfy_url} {acestep_url} {base}
 
 global:
@@ -12,6 +18,7 @@ activities:
     description: a long run you do not want killed — it never yields the machine
     priority: 90
     preemptible: false
+    reentrant: false          # two trainings are two workloads: the second one waits
     vram_gb: 16
     default_wait: 0
     default_ttl: 43200
@@ -21,6 +28,7 @@ activities:
     description: LLM models behind llama-swap (:8081) — the lease lasts as long as the
       llama-server process
     priority: 50
+    attended_priority: 60     # a chat waits 90 s and gives up: it goes ahead of queued batch work
     preemptible: true
     vram_gb: 15.7
     vram_gb_by_note:

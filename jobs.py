@@ -100,9 +100,18 @@ class Queue:
         """`prio` from the caller can only LOWER the priority the registry gives the activity —
         yielding your turn is polite, granting yourself precedence is not. A caller that declared
         priority 999 would walk past everybody and make a preemptible holder yield to it.
-        `may_raise` is for the administrative path, the one that already needs a token."""
+        `may_raise` is for the administrative path, the one that already needs a token.
+        An `attended` job is ranked by `attended_priority` when the activity declares one: the
+        ceiling moves, the rule that the caller can only lower it does not."""
         a = self.arb.activity(kind)   # raises KeyError if the kind is not in the registry
         mine = int(a.get("priority", 50))
+        if attended:
+            # Somebody is on the other end waiting for this answer, and all their patience is
+            # `default_wait` seconds — a batch job can wait for hours and lose nothing. Where the
+            # registry declares `attended_priority`, a request with a human behind it goes ahead of
+            # queued batch work. It takes the machine away from nobody: whether the holder yields
+            # is still decided by its own `preemptible`, not by who is waiting.
+            mine = int(a.get("attended_priority", mine))
         if prio is None:
             prio = mine
         elif not may_raise:
@@ -325,7 +334,9 @@ class Queue:
         registry, or the lowest-priority work never overtakes the highest and starves. Read from
         the registry rather than hardcoded, because the gap is whatever the user wrote."""
         try:
-            prios = [int(a.get("priority", 50)) for a in self.arb.reg.get("activities", {}).values()]
+            acts = list(self.arb.reg.get("activities", {}).values())
+            prios = ([int(a.get("priority", 50)) for a in acts]
+                     + [int(a["attended_priority"]) for a in acts if "attended_priority" in a])
         except Exception:
             prios = []
         return max(60, (max(prios) - min(prios) + 1) if prios else 0)
@@ -470,8 +481,11 @@ class Queue:
         with open(log_file, "w") as lf:
             # start_new_session: the job becomes its own process group, so stopping it reaches the
             # children too (run_prompt.py → python → …), instead of leaving orphans on the GPU.
+            # VRAMBLE_LEASE: what the job starts with gpu-lease is part of this lease, not a second
+            # session — the same hand-off `gpu-lease run` does, for `reentrant: false` activities.
             proc = subprocess.Popen(argv, stdout=lf, stderr=subprocess.STDOUT, text=True,
-                                    start_new_session=True)
+                                    start_new_session=True,
+                                    env=dict(os.environ, VRAMBLE_LEASE=token) if token else None)
             with self.lock:
                 self._procs[jid] = proc        # CPU lane included: cancel must reach it too
             while proc.poll() is None:

@@ -138,6 +138,48 @@ class Http(VrambleTest):
         self.assertEqual(r["holder"]["activity"], "research")
         self.assertIn("training", r["holder"]["note"])
 
+    def test_a_refused_llm_call_says_who_holds_the_machine_and_for_how_long(self):
+        """A 429 that only says 'busy' is indistinguishable from a broken queue: the caller retries,
+        is refused again, and concludes that nothing is being served. It must name the holder."""
+        self.arb.acquire("research", note="training", ttl=3600)
+        c, r = self.call("/v1/chat/completions", {"model": "soft", "messages": []}, "POST",
+                         {"X-Wait": "0"})
+        self.assertEqual(c, 429)
+        self.assertTrue(r["waiting"])
+        self.assertEqual(r["holder"]["activity"], "research")
+        self.assertFalse(r["holder"]["preemptible"])
+        self.assertIn("research", r["message"])
+        self.assertIn("training", r["message"])
+        self.assertIn("up to", r["message"], "a TTL is an upper bound and must be said as one")
+        self.assertGreaterEqual(r["retry_after_s"], 30)
+        self.assertLessEqual(r["retry_after_s"], 900, "never send the caller away for hours")
+
+    def test_a_refused_llm_call_carries_a_retry_after_header(self):
+        self.arb.acquire("research", note="training", ttl=3600)
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                                     method="POST", data=json.dumps({"model": "soft"}).encode(),
+                                     headers={"Content-Type": "application/json", "X-Wait": "0"})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("a held machine must refuse the call")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 429)
+            self.assertTrue((e.headers.get("Retry-After") or "").isdigit(),
+                            "429 is the one status code every HTTP client knows how to wait on")
+
+    def test_with_nobody_holding_the_machine_the_excuse_counts_the_queue(self):
+        holder, retry, why = self.vramble.queue_excuse(None, {"ahead": [{"id": "j1"}, {"id": "j2"}]})
+        self.assertIsNone(holder)
+        self.assertIn("2", why)
+        self.assertGreater(retry, 0)
+
+    def test_a_holder_that_yields_on_its_own_is_not_worth_a_long_wait(self):
+        _, retry, why = self.vramble.queue_excuse(
+            {"activity": "comfy", "note": "video", "held_s": 40, "expires_in_s": 1700,
+             "preemptible": True}, {})
+        self.assertLessEqual(retry, 30, "a preemptible holder frees the card between two jobs")
+        self.assertIn("yields", why)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

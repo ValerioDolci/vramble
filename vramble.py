@@ -147,6 +147,7 @@ class Arbiter:
         self.handover = None    # activity we are handing the machine to (drain/start under way)
         self.waiting = {}             # wait_id -> {activity, prio, ts, seen}
         self._cooldown = {}           # activity -> monotonic time before which draining is pointless
+        self._told = {}               # refusal already logged -> when (see _say_once)
         self.preempt_asked = None
         self.load_registry()
 
@@ -256,6 +257,16 @@ class Arbiter:
 
     BLIND_RESTORE_S = 300   # a lease restored on a guess lives 5 minutes unless somebody beats it
     COOLDOWN_S = 60      # after a drain that freed nothing, leave that activity alone for a while
+
+    def _say_once(self, msg, key, every=300.0):
+        """Log a refusal once per waiter, not on every poll of its wait. Caller holds the lock."""
+        now = time.monotonic()
+        if key in self._told and now - self._told[key] < every:
+            return
+        for k in [k for k, t in self._told.items() if now - t >= every]:
+            del self._told[k]
+        self._told[key] = now
+        log(msg)
 
     def free_leftovers(self, apart_from, requested_vram):
         """Before granting: clear out whoever holds VRAM without holding the lease.
@@ -402,7 +413,7 @@ class Arbiter:
             }
 
     def acquire(self, name, note="", ttl=None, wait=0, preempt=False, wait_id=None, internal=True,
-                since=None):
+                since=None, parent=None):
         # `since`: how long this request has really been waiting. A queued job asks again every ~18 s,
         # and its slot in the line expires after 20 s of silence: taking the timestamp of the *attempt*
         # made it lose its seniority to anyone who happened to be polling without interruption. With
@@ -411,6 +422,9 @@ class Arbiter:
         # already running (llama-server inside an agent run, run_prompt inside a job): with False the
         # agent could no longer use the model during its own run. New requests come from the queue,
         # and the worker passes internal=False explicitly.
+        # `parent`: the token of the lease this request was started inside (`gpu-lease run` hands it
+        # to its command as VRAMBLE_LEASE). It is what lets work nest inside a `reentrant: false`
+        # activity without letting a second, independent session of that activity in.
         """Decide under the lock; drain and start OUTSIDE it. A dying process must be able to call
         /release: holding the lock kept it hanging until its launcher killed it — 30 s wasted."""
         with self.lock:
@@ -426,7 +440,17 @@ class Arbiter:
 
             # reentrancy: the same activity still at work. Its OWN token here too: handing out the
             # owner's token means the first `release` would dissolve everybody's lease.
-            if o and o["activity"] == name:
+            # Right for an activity that is one shared server (llm behind llama-swap, ComfyUI): a
+            # second lease is one more request to the same process. Wrong for one whose every lease
+            # is its own process wanting the whole card (a training, a benchmark session): there a
+            # second session is a second workload, and letting it in is an OOM for whoever arrives
+            # second (twice on 05/10). Those declare `reentrant: false` and re-enter only from
+            # inside the lease (`parent`); anyone else falls through and waits like any contender.
+            reentrant = a.get("reentrant", True) is not False
+            nested = isinstance(parent, str) and o is not None and parent in o.get("tokens", {})
+            if o and o["activity"] == name and (reentrant or nested):
+                if not reentrant:
+                    log(f"{name} ({note}) nested inside the lease of {o['activity']} ({o['note']})")
                 o["seq"] = o.get("seq", 0) + 1
                 tok = f"{o['token']}#{o['seq']}"
                 o["tokens"][tok] = name
@@ -458,10 +482,22 @@ class Arbiter:
                                                               "ts": self._since(since)})
                         c["ts"] = min(c["ts"], self._since(since))
                         c["seen"] = time.monotonic()
-                    return 409, {"error": "busy", "holder": self._holder_view(),
-                                 "queued": bool(wait and wait_id),
-                                 "default_wait": float(a.get("default_wait", 0) or 0),
-                                 "hint": f'gpu-lease preempt "{name} needs the machine"'}
+                    body = {"error": "busy", "holder": self._holder_view(),
+                            "queued": bool(wait and wait_id),
+                            "default_wait": float(a.get("default_wait", 0) or 0),
+                            "hint": f'gpu-lease preempt "{name} needs the machine"'}
+                    if o["activity"] == name:
+                        # A second session of a non-reentrant activity: say why, once per session
+                        # (the CLI asks again every 3 s while it waits).
+                        body["not_reentrant"] = True
+                        body["hint"] = (f"{name} is not reentrant: a second session waits for the first. "
+                                        "Work started inside that lease re-enters by inheriting "
+                                        "VRAMBLE_LEASE (gpu-lease run sets it; systemd-run needs "
+                                        "-E VRAMBLE_LEASE)")
+                        self._say_once(f"{name} ({note}) kept out: {o['activity']} ({o['note']}) "
+                                       f"holds the machine and {name} is not reentrant",
+                                       (name, note, o["token"]))
+                    return 409, body
                 log(f"{name} takes over from {o['activity']}"
                       f"{' (preempted)' if preempt else ''}")
                 preempted = o["activity"]
@@ -963,7 +999,7 @@ class H(BaseHTTPRequestHandler):
             elif self.path == "/lease":
                 c, r = ARB.acquire(d["activity"], d.get("note", ""), d.get("ttl"),
                                       d.get("wait", 0), bool(d.get("preempt")), d.get("wait_id"),
-                                      bool(d.get("internal", True)))
+                                      bool(d.get("internal", True)), parent=d.get("parent"))
             elif self.path == "/heartbeat":
                 c, r = ARB.heartbeat(d.get("token", ""))
             elif self.path == "/release":

@@ -13,6 +13,11 @@
 If vramble does not answer the command runs anyway (fail-open): the arbiter must never be able to block
 production. A service that would fight over VRAM should pass --require-lease and get the opposite.
 Exit codes: 75 = machine busy · 76 = no lease and --require-lease.
+
+`run` hands its lease token to the command as VRAMBLE_LEASE, and every request sends the one it
+inherited: that is how work started inside a lease of a `reentrant: false` activity (a script of a
+training calling gpu-lease again) re-enters it, while a second, independent session waits its turn.
+Under systemd-run the environment is not inherited: pass `-E VRAMBLE_LEASE`.
 """
 import http.client, json, os, socket, signal, subprocess, sys, threading, time, urllib.error, urllib.request
 
@@ -35,6 +40,7 @@ except Exception:                                   # CLI copied elsewhere: keep
 BUSY = 75
 NO_LEASE = 76          # --require-lease and vramble never answered: better not to start at all
 REQUIRE_WAIT = float(os.environ.get("GPU_LEASE_REQUIRE_WAIT", 30))   # vramble restarts in ~3 s
+PARENT = os.environ.get("VRAMBLE_LEASE", "")      # the lease we were started inside, if any
 
 
 def _headers():
@@ -108,13 +114,17 @@ def busy_line(r):
         t = f"{o['held_s'] // 60} min"
     return (f"machine busy: {o.get('activity')} ({o.get('note') or 'no note'}) for {t}"
             f", lease valid {o.get('expires_in_s', 0)}s more"
-            + ("" if o.get("preemptible") else " · not preemptible: `gpu-lease preempt <activity>`"))
+            + ("" if o.get("preemptible") else " · not preemptible: `gpu-lease preempt <activity>`")
+            + (f" · {o.get('activity')} is not reentrant: a second session waits for the first"
+               if r.get("not_reentrant") else ""))
 
 
 def acquire(a, args):
     """Take the lease. How long to wait for your turn comes from the registry (default_wait
     of the activity), unless --wait overrides it: a batch job waits, an interactive one does not."""
     body = {"activity": a, "note": args.get("note", ""), "preempt": args.get("preempt", False)}
+    if PARENT:
+        body["parent"] = PARENT
     if args.get("ttl"):
         body["ttl"] = float(args["ttl"])
     explicit = args.get("wait") is not None
@@ -184,7 +194,10 @@ def beat(state, stop, every, activity, note):
         code, r = call("/heartbeat", {"token": state["token"]}, timeout=30)
         if code != 410:
             continue
-        code, r = call("/lease", {"activity": activity, "note": note}, timeout=120)
+        again = {"activity": activity, "note": note}
+        if PARENT:
+            again["parent"] = PARENT
+        code, r = call("/lease", again, timeout=120)
         if code == 200 and r.get("token"):
             state["token"] = r["token"]
             print("[gpu-lease] lease taken again after it was revoked", file=sys.stderr)
@@ -271,8 +284,12 @@ def main():
                 every = max(2, int(min(every, ttl_lease / 3)))
             threading.Thread(target=beat,
                              args=(state, stop, every, activity, args.get("note", "")), daemon=True).start()
+        # The command gets our token: what it starts with gpu-lease is part of this lease, not a
+        # second session (it matters for `reentrant: false` activities). Without a lease
+        # (fail-open) it inherits whatever we inherited.
+        env = dict(os.environ, VRAMBLE_LEASE=state["token"]) if lease else None
         # the wrapper must not swallow signals: llama-swap & co. terminate the child, not us
-        proc = subprocess.Popen(cmdline)
+        proc = subprocess.Popen(cmdline, env=env)
 
         def forward(sig, _frame):
             try:
