@@ -82,6 +82,9 @@ runs anyway — the arbiter must never be able to block a person working by hand
 3. The environment is started if needed, the job runs, the lease is released, and after the idle
    timeout the VRAM is freed.
 
+On the `/v1/*` proxy only `Content-Type`, `Authorization` and the optional `X-Ninfer-Client`
+header (a caller label the model server records in its request log) reach the model server.
+
 ## Who is allowed to ask
 
 vramble listens on `127.0.0.1` only, and refuses any POST that carries an `Origin` or `Referer` header,
@@ -155,6 +158,7 @@ activities:
   llm:
     match: llama-server|vllm         # how to recognise its processes on the card
     priority: 50
+    attended_priority: 60            # …but a request with somebody waiting goes first
     preemptible: true                # can yield without losing work
     vram_gb: 15.7                    # >= whole_card_threshold_gb means it wants the card alone
     default_wait: 90                 # how long a request for it queues before giving up
@@ -167,6 +171,13 @@ activities:
 
 A service that must never start unarbitrated takes the lease itself:
 `gpu-lease run llm --require-lease -- llama-server …`.
+
+A second lease of the activity that already holds the machine normally joins it: for `llm` it is
+one more request to the same llama-swap. For an activity where every lease is its own process
+wanting the whole card — a training, a benchmark session — that is a second workload landing on a
+full card. Declare it `reentrant: false`: a second session then waits for the first like any other
+contender (or exits 75), and only what runs *inside* the lease re-enters, recognised by the token
+`gpu-lease run` hands its command in `VRAMBLE_LEASE` (under `systemd-run`, pass `-E VRAMBLE_LEASE`).
 
 ## Who decides the priority
 
@@ -181,6 +192,30 @@ requires its own token, may raise.
 Within the same priority, first come first served — and a job waiting gains one point a minute, up
 to more than the widest gap in your registry, so the lowest-priority work eventually goes through
 instead of waiting forever behind a stream of urgent requests.
+
+An activity may also declare `attended_priority`, used when somebody is waiting on the other end of
+the request — a chat, a bot. Their patience is `default_wait` seconds; a batch job's is hours, and
+it loses nothing by letting them pass. It changes the order of the queue only: whether the holder
+gives the machine up is still decided by its own `preemptible`, never by who is asking.
+
+## What a refused request is told
+
+A request whose turn does not come within `default_wait` gets a `429` with a `Retry-After` header
+and a body that names the holder:
+
+```json
+{"waiting": true, "job": "j0238", "position": 1, "retry_after_s": 900,
+ "holder": {"activity": "research", "note": "depth curve", "held_s": 4321,
+            "expires_in_s": 10079, "preemptible": false},
+ "message": "busy: research (depth curve) has held the GPU for 1h12m and can keep it for up to
+             2h47m more. It cannot be interrupted without losing work: wait, or `gpu-lease preempt`"}
+```
+
+This is not decoration. A refusal that says only *busy* is indistinguishable from a broken queue:
+the caller retries, is refused again, and concludes the service is down — while the arbiter is
+doing exactly its job. Every duration is an upper bound (a lease ends when the work ends, usually
+well before its TTL), so the wording says *up to*, and `retry_after_s` never sends anybody away for
+more than a quarter of an hour.
 
 ## When something does not give the card back
 
