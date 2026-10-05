@@ -15,6 +15,7 @@ HTTP API (127.0.0.1:8099 by default, JSON):
   POST /api/requests {service, <params>}                    -> queued job, built from the catalog
   GET  /api/jobs[/<id>] · GET /api/services · GET /status[?text=1]
   POST /v1/…      OpenAI proxy; headers X-Wait, X-Ttl, X-Prio, X-Requester
+                  -> 429 {holder, retry_after_s, message,…} + Retry-After when the turn never came
 
 Paths, ports and endpoints live in config.yaml (see config.example.yaml), never in the code.
 """
@@ -364,23 +365,37 @@ class Arbiter:
         log(f"lease restored: {saved['activity']} ({saved.get('note')}) holds {held} MiB, "
             f"{int(left)}s left")
 
+    def _holder_view(self):
+        """The holder as the outside world sees it. The caller must already hold the lock."""
+        o = self.holder
+        if not o:
+            return None
+        return {
+            "activity": o["activity"], "note": o["note"], "leftover": o.get("leftover"),
+            "held_s": int(time.monotonic() - o["since"]),
+            "expires_in_s": int(o["expires"] - time.monotonic()), "refs": o["refs"],
+            "preemptible": bool(self.activity(o["activity"]).get("preemptible")),
+            "preempt_asked": self.preempt_asked,
+        }
+
+    def busy(self):
+        """Who holds the machine, without asking the GPU anything. `state()` shells out to
+        nvidia-smi; this is for the paths that answer somebody who is waiting, where a second
+        of `nvidia-smi` is a second added to an already bad answer."""
+        with self.lock:
+            self._revoke_if_expired()
+            return self._holder_view()
+
     def state(self):
         holders = self.vram_holders()      # before the lock: it may shell out to nvidia-smi
         with self.lock:
             self._revoke_if_expired()
-            o = self.holder
             waiting = sorted(
                 [c for c in self.waiting.values() if time.monotonic() - c["seen"] < 20],
                 key=lambda c: (-c["prio"], c["ts"]),
             )
             return {
-                "holder": None if not o else {
-                    "activity": o["activity"], "note": o["note"], "leftover": o.get("leftover"),
-                    "held_s": int(time.monotonic() - o["since"]),
-                    "expires_in_s": int(o["expires"] - time.monotonic()), "refs": o["refs"],
-                    "preemptible": bool(self.activity(o["activity"]).get("preemptible")),
-                    "preempt_asked": self.preempt_asked,
-                },
+                "holder": self._holder_view(),
                 "queue": [{"activity": c["activity"], "waiting_s": int(time.monotonic() - c["ts"])} for c in waiting],
                 "vram_mib": vram(),
                 "registry": REGISTRY, "vram_by_activity": holders,
@@ -679,17 +694,57 @@ TOKEN = config.C["token"]          # when set, POSTs must carry X-Vramble
 SUBMIT_TOKEN = config.C["submit_token"]   # /api/jobs runs an arbitrary argv: closed unless set
 
 
+def spell_s(n):
+    """A duration as somebody reads it out loud: 45s, 12m, 1h12m. Whoever is waiting wants to know
+    whether to stay or to come back later, and `4331 s` does not answer that question."""
+    n = max(0, int(n))
+    if n < 90:
+        return f"{n}s"
+    if n < 3600:
+        return f"{n // 60}m"
+    return f"{n // 3600}h{(n % 3600) // 60:02d}m"
+
+
+def queue_excuse(holder, s):
+    """What to tell somebody whose turn never came. Returns (holder, retry_after_s, message).
+
+    A request that is refused without saying who took the machine and for how long is
+    indistinguishable from a broken service: the caller retries, is refused again, and concludes
+    that the queue is not being served. So the refusal carries the holder by name.
+
+    Every duration here is an UPPER bound — a lease ends when the work ends, usually well before
+    its TTL, and a heartbeat can also push the deadline out. Hence `up to`, and hence a
+    `retry_after_s` that never suggests waiting more than a quarter of an hour: whoever is waiting
+    should look again long before the declared deadline."""
+    ahead = len(s.get("ahead") or [])
+    if not holder:
+        if ahead:
+            return None, 15, f"busy: {ahead} request(s) are ahead of yours"
+        return None, 15, "the machine is working on another request"
+    who = holder["activity"] + (f" ({holder['note']})" if holder.get("note") else "")
+    held = spell_s(holder.get("held_s") or 0)
+    if holder.get("preemptible"):
+        return holder, 15, (f"busy: {who} has held the GPU for {held} and yields on its own as soon "
+                            f"as its current piece of work ends")
+    left = int(holder.get("expires_in_s") or 0)
+    return holder, max(30, min(left, 900)), (
+        f"busy: {who} has held the GPU for {held} and can keep it for up to {spell_s(left)} more. "
+        f"It cannot be interrupted without losing work: wait, or `gpu-lease preempt` on the machine")
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):
         pass
 
-    def _reply(self, code, obj):
+    def _reply(self, code, obj, headers=None):
         body = (obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)).encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8" if isinstance(obj, str) else "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(body)
 
@@ -720,9 +775,12 @@ class H(BaseHTTPRequestHandler):
         if not QUEUE.wait_turn(jid, cutoff):
             s = QUEUE.job_state(jid) or {}
             QUEUE.give_up(jid)      # otherwise the job would keep holding its place in the queue
+            holder, retry, why = queue_excuse(ARB.busy(), s)
             return self._reply(429, {"waiting": True, "job": jid, "position": s.get("position"),
                                         "ahead": s.get("ahead"), "model": model,
-                                        "message": "the machine is working on another request"})
+                                        "holder": holder, "waited_s": int(cutoff),
+                                        "retry_after_s": retry, "message": why},
+                                 headers={"Retry-After": retry})
         rc, note, sent = 0, "", False
         # Registered BEFORE the upstream call: between getting the turn and holding the connection
         # there is a window where a cancel would find nothing to stop, decide nothing was running,
@@ -744,9 +802,10 @@ class H(BaseHTTPRequestHandler):
         try:
             if upstream["cancelled"]:        # cancelled while we were registering
                 raise urllib.error.URLError("cancelled before the request was sent")
-            req = urllib.request.Request(SWAP_URL + path, data=body,
-                                         headers={"Content-Type": "application/json",
-                                                  "Authorization": "Bearer local"}, method="POST")
+            forward = {"Content-Type": "application/json", "Authorization": "Bearer local"}
+            if self.headers.get("X-Ninfer-Client"):      # caller label for ninfer's request log
+                forward["X-Ninfer-Client"] = self.headers["X-Ninfer-Client"]
+            req = urllib.request.Request(SWAP_URL + path, data=body, headers=forward, method="POST")
             with urllib.request.urlopen(req, timeout=min(float(config.C["timeout_llm"]), max(60.0, ttl_job))) as r:
                 self.send_response(r.status)
                 for k in ("Content-Type", "Cache-Control"):
